@@ -1,0 +1,167 @@
+import asyncio
+import hashlib
+import logging
+import os
+from datetime import datetime
+
+import aiosqlite
+import feedparser
+import httpx
+import trafilatura
+from aiogram import Bot, Dispatcher
+from aiogram.client.default import DefaultBotProperties
+from aiogram.enums import ParseMode
+from apscheduler.schedulers.asyncio import AsyncIOScheduler
+from dotenv import load_dotenv
+
+load_dotenv()
+
+# ═══════════════════════════════════════════════════════════
+# КОНФИГУРАЦИЯ (с очисткой от пробелов)
+# ═══════════════════════════════════════════════════════════
+TELEGRAM_TOKEN = os.getenv("TELEGRAM_TOKEN", "").strip()
+OPENROUTER_API_KEY = os.getenv("OPENROUTER_API_KEY", "").strip()
+OPENROUTER_MODEL = os.getenv("OPENROUTER_MODEL", "mistralai/mistral-7b-instruct:free").strip()
+CHANNEL_ID = os.getenv("CHANNEL_ID", "").strip()
+DB_PATH = "news_bot.db"
+
+# Список RSS (можно расширить)
+RSS_URLS = [
+    "https://lenta.ru/rss/news",
+    "https://ria.ru/export/rss2/archive/index.xml",
+    "https://rbc.ru/rss/all",
+    "https://habr.com/ru/rss/news/?fl=ru",
+]
+
+# Настройка логирования
+logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
+
+# ═══════════════════════════════════════════════════════════
+# РАБОТА С БАЗОЙ ДАННЫХ
+# ═══════════════════════════════════════════════════════════
+
+async def init_db():
+    async with aiosqlite.connect(DB_PATH) as db:
+        await db.execute("""
+            CREATE TABLE IF NOT EXISTS sent_news (
+                hash TEXT PRIMARY KEY,
+                published_at DATETIME
+            )
+        """)
+        await db.commit()
+
+async def is_news_sent(news_hash):
+    async with aiosqlite.connect(DB_PATH) as db:
+        async with db.execute("SELECT 1 FROM sent_news WHERE hash = ?", (news_hash,)) as cursor:
+            return await cursor.fetchone() is not None
+
+async def save_news_hash(news_hash):
+    async with aiosqlite.connect(DB_PATH) as db:
+        await db.execute("INSERT OR REPLACE INTO sent_news (hash, published_at) VALUES (?, ?)",
+                         (news_hash, datetime.now()))
+        await db.commit()
+
+# ═══════════════════════════════════════════════════════════
+# ИНТЕГРАЦИЯ С ИИ (OPENROUTER)
+# ═══════════════════════════════════════════════════════════
+
+async def summarize_news(text, title):
+    if not OPENROUTER_API_KEY:
+        return f"<b>{title}</b>\n\n{text[:500]}..."
+
+    prompt = (
+        f"Сделай краткий пересказ новости для Telegram-канала.\n"
+        f"Заголовок: {title}\nТекст: {text}\n\n"
+        "Требования: живой язык, информативно, около 500-800 знаков, используй эмодзи."
+    )
+
+    headers = {
+        "Authorization": f"Bearer {OPENROUTER_API_KEY}",
+        "Content-Type": "application/json",
+        "HTTP-Referer": "https://github.com",
+    }
+    payload = {
+        "model": OPENROUTER_MODEL,
+        "messages": [{"role": "user", "content": prompt}]
+    }
+
+    try:
+        async with httpx.AsyncClient() as client:
+            response = await client.post("https://openrouter.ai/api/v1/chat/completions", 
+                                         headers=headers, json=payload, timeout=30.0)
+            response.raise_for_status()
+            result = response.json()
+            return result['choices'][0]['message']['content']
+    except Exception as e:
+        logging.error(f"Ошибка OpenRouter: {e}")
+        return f"<b>{title}</b>\n\n{text[:500]}..."
+
+# ═══════════════════════════════════════════════════════════
+# ПАРСИНГ И ОТПРАВКА
+# ═══════════════════════════════════════════════════════════
+
+async def check_news(bot: Bot):
+    logging.info("Начинаю проверку RSS лент...")
+    async with httpx.AsyncClient() as client:
+        for url in RSS_URLS:
+            try:
+                response = await client.get(url, timeout=10.0)
+                feed = feedparser.parse(response.text)
+                
+                for entry in feed.entries[:3]:
+                    news_link = entry.link
+                    news_hash = hashlib.md5(news_link.encode()).hexdigest()
+
+                    if await is_news_sent(news_hash):
+                        continue
+
+                    # Извлекаем текст статьи
+                    downloaded = trafilatura.fetch_url(news_link)
+                    full_text = trafilatura.extract(downloaded) if downloaded else entry.get('summary', '')
+
+                    if not full_text or len(full_text) < 100:
+                        continue
+
+                    # Обработка нейросетью
+                    final_post = await summarize_news(full_text, entry.title)
+                    final_post += f"\n\n<a href='{news_link}'>Читать полностью</a>"
+
+                    # Отправка в канал
+                    await bot.send_message(CHANNEL_ID, final_post, parse_mode=ParseMode.HTML)
+                    await save_news_hash(news_hash)
+                    logging.info(f"Опубликована новость: {entry.title}")
+                    
+                    await asyncio.sleep(5)
+
+            except Exception as e:
+                logging.error(f"Ошибка при обработке {url}: {e}")
+
+# ═══════════════════════════════════════════════════════════
+# ЗАПУСК
+# ═══════════════════════════════════════════════════════════
+
+async def main():
+    await init_db()
+    
+    bot = Bot(
+        token=TELEGRAM_TOKEN, 
+        default=DefaultBotProperties(parse_mode=ParseMode.HTML)
+    )
+    dp = Dispatcher()
+
+    # Настройка планировщика
+    scheduler = AsyncIOScheduler()
+    scheduler.add_job(check_news, "interval", minutes=30, args=[bot])
+    scheduler.start()
+
+    # Первый запуск сразу после включения
+    asyncio.create_task(check_news(bot))
+
+    logging.info("Бот запущен и планировщик настроен.")
+    await dp.start_polling(bot)
+
+if __name__ == "__main__":
+    try:
+        asyncio.run(main())
+    except (KeyboardInterrupt, SystemExit):
+        logging.info("Бот остановлен.")
