@@ -1,0 +1,153 @@
+import asyncio
+import hashlib
+import logging
+import os
+from datetime import datetime
+
+import aiosqlite
+import feedparser
+import httpx
+import trafilatura
+from aiogram import Bot, Dispatcher
+from aiogram.client.default import DefaultBotProperties
+from aiogram.enums import ParseMode
+from apscheduler.schedulers.asyncio import AsyncIOScheduler
+from dotenv import load_dotenv
+
+load_dotenv()
+
+# ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+# КОНФИГУРАЦИЯ
+# ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+TELEGRAM_TOKEN = os.getenv("TELEGRAM_TOKEN", "").strip()
+OPENROUTER_API_KEY = os.getenv("OPENROUTER_API_KEY", "").strip()
+OPENROUTER_MODEL = os.getenv("OPENROUTER_MODEL", "mistralai/mistral-7b-instruct:free").strip()
+CHANNEL_ID = os.getenv("CHANNEL_ID", "").strip()
+DB_PATH = "news_bot.db"
+
+RSS_URLS = [
+    "https://lenta.ru/rss/news",
+    "https://ria.ru/export/rss2/archive/index.xml",
+    "https://www.rbc.ru/rss/all",
+    "https://habr.com/ru/rss/news/?fl=ru",
+]
+
+logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(message)s')
+
+# ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+# БАЗА ДАННЫХ
+# ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+async def init_db():
+    async with aiosqlite.connect(DB_PATH) as db:
+        await db.execute("CREATE TABLE IF NOT EXISTS sent_news (hash TEXT PRIMARY KEY, dt DATETIME)")
+        await db.commit()
+
+async def is_new(news_hash):
+    async with aiosqlite.connect(DB_PATH) as db:
+        async with db.execute("SELECT 1 FROM sent_news WHERE hash = ?", (news_hash,)) as cur:
+            return await cur.fetchone() is None
+
+async def mark_as_sent(news_hash):
+    async with aiosqlite.connect(DB_PATH) as db:
+        await db.execute("INSERT INTO sent_news VALUES (?, ?)", (news_hash, datetime.now()))
+        await db.commit()
+
+# ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+# ИНТЕГРАЦИЯ OPENROUTER
+# ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+async def get_ai_summary(text, title):
+    if not OPENROUTER_API_KEY:
+        return f"<b>{title}</b>\n\n{text[:500]}..."
+    
+    headers = {
+        "Authorization": f"Bearer {OPENROUTER_API_KEY}",
+        "Content-Type": "application/json",
+        "HTTP-Referer": "https://github.com",
+    }
+    prompt = f"Сделай краткий пост для Телеграм канала по этой новости. Заголовок: {title}\nТекст новости: {text}\nИспользуй эмодзи, пиши живым языком, не более 700 символов."
+    
+    async with httpx.AsyncClient() as client:
+        try:
+            resp = await client.post(
+                "https://openrouter.ai/api/v1/chat/completions",
+                headers=headers,
+                json={
+                    "model": OPENROUTER_MODEL,
+                    "messages": [{"role": "user", "content": prompt}],
+                    "temperature": 0.8,
+                    "max_tokens": 1024,
+                },
+                timeout=45.0
+            )
+            resp.raise_for_status()
+            return resp.json()['choices'][0]['message']['content'].strip()
+        except Exception as e:
+            logging.error(f"AI Error: {e}")
+            return f"<b>{title}</b>\n\n{text[:500]}..."
+
+# ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+# ПАРСИНГ RSS И ПУБЛИКАЦИЯ
+# ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+async def check_news(bot: Bot):
+    logging.info("🔍 Начинаю проверку RSS лент")
+    
+    for url in RSS_URLS:
+        try:
+            feed = feedparser.parse(url)
+            for entry in feed.entries[:3]:
+                news_link = entry.link.strip()
+                news_hash = hashlib.md5(news_link.encode()).hexdigest()
+                
+                if not await is_new(news_hash):
+                    continue
+
+                # Извлекаем полный текст статьи
+                content = trafilatura.fetch_url(news_link)
+                article_text = trafilatura.extract(content) if content else entry.get('summary', '')
+                
+                if not article_text or len(article_text) < 100:
+                    continue
+
+                # Обработка ИИ
+                final_post = await get_ai_summary(article_text, entry.title)
+                final_post += f"\n\n<a href='{news_link}'>Источник</a>"
+
+                # Отправка в канал
+                await bot.send_message(CHANNEL_ID, final_post, parse_mode=ParseMode.HTML)
+                await mark_as_sent(news_hash)
+                
+                logging.info(f"✅ Опубликовано: {entry.title[:50]}...")
+                await asyncio.sleep(5)
+
+        except Exception as e:
+            logging.error(f"❌ Ошибка при обработке {url}: {e}")
+
+    logging.info("✅ Проверка завершена")
+
+# ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+# ЗАПУСК БОТА
+# ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+async def main():
+    await init_db()
+
+    bot = Bot(
+        token=TELEGRAM_TOKEN,
+        default=DefaultBotProperties(parse_mode=ParseMode.HTML)
+    )
+    dp = Dispatcher()
+    
+    scheduler = AsyncIOScheduler()
+    scheduler.add_job(check_news, "interval", minutes=30, args=[bot])
+    scheduler.start()
+
+    # Первый запуск сразу после старта
+    asyncio.create_task(check_news(bot))
+
+    logging.info("🚀 Бот запущен")
+    await dp.start_polling(bot)
+
+if __name__ == "__main__":
+    try:
+        asyncio.run(main())
+    except (KeyboardInterrupt, SystemExit):
+        logging.info("⏹️ Бот остановлен")
